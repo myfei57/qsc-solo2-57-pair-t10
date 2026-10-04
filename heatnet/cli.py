@@ -91,7 +91,11 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     secondary = platform.secondary_cycle(args.dt)
     heat = [platform.collect_heat(name, args.sample_mwh) for name in platform.meter_names()]
     settled = platform.settle_quota()
+    split_plan = platform.plan_zone_split(args.split_zone, args.split_stations, args.new_zone)
     split = platform.split_zone(args.split_zone, args.split_stations, args.new_zone)
+    reconciled = platform.reconcile_migration()
+    rolled_back = platform.rollback_zone_split(split["migration"]["migration_id"])
+    resplit = platform.split_zone(args.split_zone, args.split_stations, args.new_zone)
     queued = platform.queue_commands(args.station, [55.0, 62.0], "demo-operator")
     replayed = platform.replay_valves([args.station])
     disturbance = platform.disturb_secondary(args.disturb)
@@ -121,7 +125,22 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "secondary": {key: secondary[key] for key in ("ok", "flow_t_h", "pump_idle", "violations")},
         "heat": heat,
         "settled": settled,
+        "split_plan": {
+            key: split_plan[key]
+            for key in ("migration_id", "inheritance", "moving", "staying", "read_policy")
+        },
         "split": split,
+        "reconcile": reconciled,
+        "rollback": {
+            "ok": rolled_back["ok"],
+            "state": rolled_back["migration"]["state"],
+            "reconcile_ok": rolled_back["reconcile"]["ok"],
+        },
+        "resplit": {
+            "ok": resplit["ok"],
+            "migration_id": resplit["migration"]["migration_id"],
+            "reconcile_ok": resplit["reconcile"]["ok"],
+        },
         "queued": queued,
         "replayed": {key: replayed[key] for key in ("ok", "replayed", "applied")},
         "disturbance": disturbance,
@@ -144,6 +163,13 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     ):
         if not operation.get("ok"):
             failures.extend(f"{name}:{item}" for item in operation.get("violations", []))
+    for name, report in (
+        ("reconcile", reconciled),
+        ("rollback_reconcile", rolled_back["reconcile"]),
+        ("resplit_reconcile", resplit["reconcile"]),
+    ):
+        if not report.get("ok"):
+            failures.extend(f"{name}:{item}" for item in report.get("violations", []))
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1

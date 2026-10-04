@@ -70,6 +70,11 @@ class Api:
         add("POST", "/api/meter", self._meter)
         add("POST", "/api/settle", self._settle)
         add("POST", "/api/zone/split", self._split)
+        add("POST", "/api/zone/split/plan", self._split_plan)
+        add("POST", "/api/zone/split/rollback", self._split_rollback)
+        add("POST", "/api/zone/split/commit", self._split_commit)
+        add("GET", "/api/migrations", lambda params, body: self._platform.migration_report())
+        add("POST", "/api/migration/reconcile", self._migration_reconcile)
         add("POST", "/api/valve/replay", self._replay)
         add("POST", "/api/pump", self._pump)
         add("POST", "/api/disturb", self._disturb)
@@ -312,6 +317,26 @@ class Api:
             str(body.get("source_zone", "")),
             [str(item) for item in stations],
             str(body.get("new_zone", "")),
+        )
+
+    def _split_plan(self, params: dict, body: dict) -> dict:
+        stations = body.get("stations") or []
+        return self._platform.plan_zone_split(
+            str(body.get("source_zone", "")),
+            [str(item) for item in stations],
+            str(body.get("new_zone", "")),
+        )
+
+    def _split_rollback(self, params: dict, body: dict) -> dict:
+        return self._platform.rollback_zone_split(str(body.get("migration_id", "")))
+
+    def _split_commit(self, params: dict, body: dict) -> dict:
+        return self._platform.commit_zone_split(str(body.get("migration_id", "")))
+
+    def _migration_reconcile(self, params: dict, body: dict) -> dict:
+        migration_id = body.get("migration_id") or params.get("migration_id")
+        return self._platform.reconcile_migration(
+            str(migration_id) if migration_id else None
         )
 
     def _replay(self, params: dict, body: dict) -> dict:

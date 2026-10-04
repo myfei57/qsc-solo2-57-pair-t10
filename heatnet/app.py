@@ -18,6 +18,7 @@ from .config import PlatformConfig, default_config
 from .errors import PlantError
 from .eventbus import Event, EventBus
 from .ids import IdFactory
+from .migration import MigrationRegistry, run_reconcile, zone_totals
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ns.zone import Zone, ZoneRegistry
@@ -101,6 +102,8 @@ class Platform:
         self.secondary = SecondaryLoop(self.config.secondary)
         self._build_zones()
         self.mapping = StationMapping(self.zones)
+        self.migrations = MigrationRegistry(self.zones, self.mapping, store)
+        self._last_reconcile: dict | None = None
 
         self.stations, self.valves, self.queues = self._build_stations()
         self.service = StationService(self.stations, self.valves, self.durable)
@@ -181,12 +184,23 @@ class Platform:
             self.namespaces.register("quota", f"{name}.heat-meter", "heat-meter")
 
     def _restore(self) -> None:
-        """从落盘状态恢复平台计数与阀门开度。"""
+        """从落盘状态恢复平台计数、阀门开度与迁移台账。"""
 
         state = self.store.read("platform_state")
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        for migration_id in self.migrations.restore():
+            self.bus.publish(
+                Event.of(
+                    "migration",
+                    "migration",
+                    "migration_stale",
+                    severity="warning",
+                    message=f"迁移 {migration_id} 与当前分区表对不上，留档不再参与解析",
+                    migration_id=migration_id,
+                )
+            )
         for name, valve in self.valves.items():
             load_valve(valve, self.durable)
             applied = self.checkpoint.load(name)
@@ -495,12 +509,21 @@ class Platform:
                 "disturbances": self.secondary.disturbances(),
             }
 
-    def split_zone(self, source_zone: str, stations: list[str], new_zone: str) -> dict:
-        """把一个分区拆成两个，并重建站归属索引。"""
+    def plan_zone_split(self, source_zone: str, stations: list[str], new_zone: str) -> dict:
+        """干跑一次拆分计划：新老分区该继承什么、哪些站归谁，一次算清。"""
 
         with self._lock:
-            child = self.zones.split(source_zone, stations, new_zone)
-            count = self.mapping.rebuild()
+            plan = self.migrations.plan(source_zone, stations, new_zone, self.clock.now())
+            return plan.as_dict()
+
+    def split_zone(self, source_zone: str, stations: list[str], new_zone: str) -> dict:
+        """把一个分区拆成两个：先算清计划，再按迁移应用，最后当场核对。"""
+
+        with self._lock:
+            plan = self.migrations.plan(source_zone, stations, new_zone, self.clock.now())
+            record, child = self.migrations.apply(
+                plan, self.clock.now(), self._migration_fingerprint()
+            )
             for name in child.stations:
                 if name in self.stations:
                     self.stations[name].rezone(child.name)
@@ -514,15 +537,123 @@ class Platform:
                     source_zone=source_zone,
                     new_zone=child.name,
                     stations=list(child.stations),
-                    index_entries=count,
+                    migration_id=record.migration_id,
+                    inheritance=record.inheritance,
+                    index_entries=len(self.mapping.index()),
                 )
             )
+            reconcile = self.reconcile_migration(record.migration_id)
             return {
                 "ok": True,
                 "zone": child.as_dict(),
                 "generation": self.mapping.generation(),
                 "index": self.mapping.describe()["index"],
+                "migration": record.as_dict(),
+                "reconcile": reconcile,
             }
+
+    def rollback_zone_split(self, migration_id: str) -> dict:
+        """把一次拆分回滚到拆分前的归属（回滚是回滚，不会重复计数）。"""
+
+        with self._lock:
+            record, source = self.migrations.rollback(migration_id, self.clock.now())
+            for name in record.moving:
+                if name in self.stations:
+                    self.stations[name].rezone(source.name)
+            self.bus.publish(
+                Event.of(
+                    "migration",
+                    "migration",
+                    "zone_split_rollback",
+                    severity="notice",
+                    message=f"迁移 {migration_id} 已回滚，归属回到拆分前",
+                    migration_id=migration_id,
+                    source_zone=record.source_zone,
+                    new_zone=record.new_zone,
+                    stations=list(record.moving),
+                )
+            )
+            reconcile = self.reconcile_migration(migration_id)
+            return {
+                "ok": True,
+                "migration": record.as_dict(),
+                "zone": source.as_dict(),
+                "generation": self.mapping.generation(),
+                "reconcile": reconcile,
+            }
+
+    def commit_zone_split(self, migration_id: str) -> dict:
+        """结束并存期：报表口径切到新分区，之后不能再回滚。"""
+
+        with self._lock:
+            record = self.migrations.commit(migration_id, self.clock.now())
+            self.bus.publish(
+                Event.of(
+                    "migration",
+                    "migration",
+                    "zone_split_commit",
+                    severity="notice",
+                    message=f"迁移 {migration_id} 已收口，报表口径切到 {record.new_zone}",
+                    migration_id=migration_id,
+                    source_zone=record.source_zone,
+                    new_zone=record.new_zone,
+                )
+            )
+            return {"ok": True, "migration": record.as_dict()}
+
+    def reconcile_migration(self, migration_id: str | None = None) -> dict:
+        """核对迁移（或当前归属）的一致性，结果落审计并供控制台展示。"""
+
+        with self._lock:
+            record = (
+                self.migrations.get(migration_id) if migration_id else self.migrations.active()
+            )
+            report = run_reconcile(
+                record,
+                zones=self.zones,
+                mapping=self.mapping,
+                stations=self.stations,
+                ledger=self.ledger,
+                audit_journal_count=self.audit.journal.count(),
+            )
+            if record is not None:
+                record.note_reconcile()
+                self.migrations.persist(record)
+            self._last_reconcile = report
+            self.bus.publish(
+                Event.of(
+                    "migration",
+                    "migration",
+                    "migration_reconcile",
+                    severity="notice" if report["ok"] else "warning",
+                    message="迁移核对一致" if report["ok"] else "迁移核对发现不一致",
+                    migration_id=report["migration_id"],
+                    violations=list(report["violations"]),
+                )
+            )
+            return report
+
+    def migration_report(self) -> dict:
+        """迁移台账：记录、双读视图与两种口径的分区热量汇总。"""
+
+        with self._lock:
+            return {
+                **self.migrations.describe(),
+                "zone_totals": {
+                    "pre": zone_totals(self.ledger, self.migrations.index_for("pre")),
+                    "post": zone_totals(self.ledger, self.migrations.index_for("post")),
+                },
+                "last_reconcile": self._last_reconcile,
+            }
+
+    def _migration_fingerprint(self) -> dict:
+        """拆分前的历史基线：审计流水、已结算周期与已落账热量。"""
+
+        return {
+            "audit_journal": self.audit.journal.count(),
+            "quota_periods": self.ledger.periods(),
+            "quota_total_mwh": round(self.ledger.total_mwh(), 4),
+        }
 
     def replay_valves(self, stations: list[str] | None = None) -> dict:
         """按检查点回放阀门指令队列。"""
@@ -812,6 +943,7 @@ class Platform:
             },
             "zones": self.zones.describe(),
             "mapping": self.mapping.describe(),
+            "migration": self.migrations.describe(),
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),

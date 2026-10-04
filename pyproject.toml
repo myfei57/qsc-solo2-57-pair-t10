@@ -14,6 +14,7 @@ addopts = "-q"
 packages = [
     "heatnet",
     "heatnet.ns",
+    "heatnet.migration",
     "heatnet.store",
     "heatnet.audit",
     "heatnet.source",

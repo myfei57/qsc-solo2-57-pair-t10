@@ -48,6 +48,11 @@ class StationMapping:
 
         return [station for station in self._zones.stations(zone_name) if self._index.get(station) == zone_name]
 
+    def index(self) -> dict[str, str]:
+        """返回当前索引的只读副本。"""
+
+        return dict(self._index)
+
     def describe(self) -> dict:
         """汇总索引，供状态快照读取。"""
 

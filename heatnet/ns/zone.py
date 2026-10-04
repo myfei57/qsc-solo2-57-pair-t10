@@ -107,6 +107,18 @@ class ZoneRegistry:
         self.rebuild_index()
         return child
 
+    def merge(self, target_name: str, dissolve_name: str) -> Zone:
+        """把一个分区并回另一个分区（拆分回滚用），返回并入后的分区。"""
+
+        target = self.get(target_name)
+        child = self.get(dissolve_name)
+        for station in list(child.stations):
+            child.drop_station(station)
+            target.add_station(station)
+        del self._zones[dissolve_name]
+        self.rebuild_index()
+        return target
+
     def rebuild_index(self) -> int:
         """按分区表重建"站 → 分区"反向索引，返回索引条目数。"""
 
