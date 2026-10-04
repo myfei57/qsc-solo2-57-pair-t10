@@ -70,6 +70,12 @@ class Api:
         add("POST", "/api/meter", self._meter)
         add("POST", "/api/settle", self._settle)
         add("POST", "/api/zone/split", self._split)
+        add("GET", "/api/migration", self._migration_status)
+        add("GET", "/api/migration/coexistence", self._migration_coexistence)
+        add("POST", "/api/migration/reconcile", self._migration_reconcile)
+        add("POST", "/api/migration/basis", self._migration_basis)
+        add("POST", "/api/migration/complete", self._migration_complete)
+        add("POST", "/api/migration/rollback", self._migration_rollback)
         add("POST", "/api/valve/replay", self._replay)
         add("POST", "/api/pump", self._pump)
         add("POST", "/api/disturb", self._disturb)
@@ -308,11 +314,33 @@ class Api:
 
     def _split(self, params: dict, body: dict) -> dict:
         stations = body.get("stations") or []
+        setpoints = body.get("station_setpoints_c") or {}
         return self._platform.split_zone(
             str(body.get("source_zone", "")),
             [str(item) for item in stations],
             str(body.get("new_zone", "")),
+            setpoints if isinstance(setpoints, dict) else {},
         )
+
+    def _migration_status(self, params: dict, body: dict) -> dict:
+        return self._platform.migration_status()
+
+    def _migration_coexistence(self, params: dict, body: dict) -> dict:
+        return self._platform.migration_coexistence()
+
+    def _migration_reconcile(self, params: dict, body: dict) -> dict:
+        return self._platform.reconcile_migration()
+
+    def _migration_basis(self, params: dict, body: dict) -> dict:
+        return self._platform.set_migration_basis(
+            str(body.get("zone", "")), str(body.get("basis", "target"))
+        )
+
+    def _migration_complete(self, params: dict, body: dict) -> dict:
+        return self._platform.complete_migration()
+
+    def _migration_rollback(self, params: dict, body: dict) -> dict:
+        return self._platform.rollback_migration()
 
     def _replay(self, params: dict, body: dict) -> dict:
         stations = body.get("stations")

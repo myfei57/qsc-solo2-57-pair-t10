@@ -18,6 +18,7 @@ from .config import PlatformConfig, default_config
 from .errors import PlantError
 from .eventbus import Event, EventBus
 from .ids import IdFactory
+from .migration import HeatHistory, Membership, MigrationManager
 from .ns.registry import NamespaceRegistry
 from .ns.topology import Topology, build_default_topology
 from .ns.zone import Zone, ZoneRegistry
@@ -111,6 +112,20 @@ class Platform:
         self._build_meters()
         self.pressure = PressurisingController(
             PressureBaseline(self.config.pressure), self.config.pressure
+        )
+
+        self.heat_history = HeatHistory()
+        self.membership = Membership(self.zones)
+        self.migrations = MigrationManager(
+            self.zones,
+            self.membership,
+            self.heat_history,
+            self.durable,
+            self.clock,
+            self.bus,
+            IdFactory("mig").next,
+            rezone_station=self._rezone_station,
+            rebuild_mapping=self.mapping.rebuild,
         )
 
         self._cycles = 0
@@ -495,34 +510,65 @@ class Platform:
                 "disturbances": self.secondary.disturbances(),
             }
 
-    def split_zone(self, source_zone: str, stations: list[str], new_zone: str) -> dict:
-        """把一个分区拆成两个，并重建站归属索引。"""
+    def _rezone_station(self, station: str, zone: str, setpoint_c: float) -> None:
+        """迁移回调：把站的归属与目标设定点在同一步更新。"""
+
+        if station in self.stations:
+            self.stations[station].rezone_with_setpoint(zone, setpoint_c)
+
+    def split_zone(
+        self,
+        source_zone: str,
+        stations: list[str],
+        new_zone: str,
+        station_setpoints_c: dict[str, float] | None = None,
+    ) -> dict:
+        """把一个分区拆成两个（逐站指定），提交即进入新旧并存。
+
+        返回的核对报告与审计、控制台共用同一份口径；并存期双归属可读，可回退。
+        """
 
         with self._lock:
-            child = self.zones.split(source_zone, stations, new_zone)
-            count = self.mapping.rebuild()
-            for name in child.stations:
-                if name in self.stations:
-                    self.stations[name].rezone(child.name)
-            self.bus.publish(
-                Event.of(
-                    "ns",
-                    "ns",
-                    "zone_split",
-                    severity="notice",
-                    message=f"分区 {source_zone} 拆出 {child.name}",
-                    source_zone=source_zone,
-                    new_zone=child.name,
-                    stations=list(child.stations),
-                    index_entries=count,
-                )
+            report = self.migrations.prepare(
+                source_zone, list(stations), new_zone, station_setpoints_c=station_setpoints_c
             )
-            return {
-                "ok": True,
-                "zone": child.as_dict(),
-                "generation": self.mapping.generation(),
-                "index": self.mapping.describe()["index"],
-            }
+            return report
+
+    def migration_status(self) -> dict:
+        """返回当前迁移状态、两套归属与不可变历史汇总。"""
+
+        with self._lock:
+            return self.migrations.describe()
+
+    def migration_coexistence(self) -> dict:
+        """返回并存期两套归属（legacy/target 同时可读）。"""
+
+        with self._lock:
+            return self.membership.coexistence()
+
+    def set_migration_basis(self, zone: str, basis: str) -> dict:
+        """并存期按分区选定统计口径（``legacy`` 或 ``target``）。"""
+
+        with self._lock:
+            return self.migrations.set_basis(zone, basis)
+
+    def reconcile_migration(self) -> dict:
+        """跑一次迁移核对，结果供控制台展示并落审计。"""
+
+        with self._lock:
+            return self.migrations.record_reconciliation()
+
+    def complete_migration(self) -> dict:
+        """切换完成：老口径归档，回退窗口关闭。"""
+
+        with self._lock:
+            return self.migrations.complete()
+
+    def rollback_migration(self) -> dict:
+        """整体回滚到拆分前归属；只回归属、不重放热量，不重复计数。"""
+
+        with self._lock:
+            return self.migrations.rollback()
 
     def replay_valves(self, stations: list[str] | None = None) -> dict:
         """按检查点回放阀门指令队列。"""
@@ -556,17 +602,26 @@ class Platform:
             return {"station": station, "queued": [command.as_dict() for command in commands]}
 
     def collect_heat(self, meter: str, delta_mwh: float) -> dict:
-        """采集一次热量并记进本期总账。"""
+        """采集一次热量并记进本期总账与不可变历史。
+
+        历史行记录*记录当时*的归属（按该分区当前口径定），拆分/回退都不改写它；
+        总账与历史写的是同一份增量，避免两边对不上。
+        """
 
         with self._lock:
+            station = meter[: -len(_METER_SUFFIX)]
             reading = self.meters.collect(meter, delta_mwh)
-            self.ledger.allocate(meter[: -len(_METER_SUFFIX)], delta_mwh)
+            self.ledger.allocate(station, delta_mwh)
+            line = self.migrations.record_heat(station, delta_mwh, period=self.ledger.periods())
             self.trend.append("heat_mwh", self.clock.now(), self.meters.total_mwh())
             return {
                 "meter": meter,
                 "delta_mwh": round(float(delta_mwh), 4),
                 "reading_mwh": round(reading, 4),
                 "total_mwh": round(self.meters.total_mwh(), 4),
+                "recorded_zone": line["recorded_zone"],
+                "basis": line["basis"],
+                "history_seq": line["seq"],
             }
 
     def settle_quota(self) -> dict:
@@ -812,6 +867,7 @@ class Platform:
             },
             "zones": self.zones.describe(),
             "mapping": self.mapping.describe(),
+            "migration": self.migrations.describe(),
             "quota": self.quota_report(),
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
@@ -827,6 +883,7 @@ class Platform:
             "namespaces": self.namespaces.describe(),
             "zones": self.zones.describe(),
             "mapping": self.mapping.describe(),
+            "migration": self.migrations.describe(),
             "trend": self.trend.snapshot(),
             "alarms_recent": self.audit.alarms()[-10:],
             "billing": self.billing(self.config.quota.meter_wrap_mwh / 40.0),
@@ -849,11 +906,20 @@ class Platform:
         return record
 
     def reset_state(self) -> bool:
-        """清掉落盘的平台计数（交付前重新标定用）。"""
+        """清掉落盘的平台计数并把分区表带回初始基线（交付前重新标定用）。
 
-        if not self.store.exists("platform_state"):
-            return False
-        return self.store.remove("platform_state")
+        活动迁移若仍在并存期，先按回滚把新分区并回（不重放热量），再删活动迁移
+        文档；已完成的拆分视为既成基线，不动分区表。
+        """
+
+        removed = self.store.exists("platform_state")
+        if removed:
+            self.store.remove("platform_state")
+        plan = self.migrations.plan()
+        if plan is not None and self.migrations.state().active:
+            self.migrations.rollback()
+        self.migrations.reset_active()
+        return removed
 
 
 def build_platform(

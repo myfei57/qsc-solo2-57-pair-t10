@@ -34,10 +34,15 @@ class HeatStation:
 
         return self._zone
 
-    def rezone(self, zone: str) -> str:
-        """更新所属分区（拆分之后由编排调用）。"""
+    def rezone_with_setpoint(self, zone: str, setpoint_c: float) -> str:
+        """迁移重归属：同时把该站目标温度钉到新分区继承下来的设定点。
+
+        设定点是拆分时对源分区设定点的一次性快照继承；缺省回落由调用方算好后
+        传入，这里只负责落值，保证"归属"与"设定点"在同一步更新。
+        """
 
         self._zone = str(zone)
+        self._target_c = float(setpoint_c)
         return self._zone
 
     def supply_c(self) -> float:

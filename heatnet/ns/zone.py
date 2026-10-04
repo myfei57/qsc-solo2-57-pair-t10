@@ -53,7 +53,9 @@ class ZoneRegistry:
     def __init__(self) -> None:
         self._zones: dict[str, Zone] = {}
         self._station_zone: dict[str, str] = {}
+        self._station_order: list[str] = []
         self._splits = 0
+        self._merges = 0
 
     def add(self, zone: Zone) -> Zone:
         """登记一个分区，重名即报错。"""
@@ -64,8 +66,15 @@ class ZoneRegistry:
             raise NamespaceError(f"分区已存在: {zone.name}", component="ns")
         self._zones[zone.name] = zone
         for station in zone.stations:
+            self._track(station)
             self._station_zone[station] = zone.name
         return zone
+
+    def _track(self, station: str) -> None:
+        """按首次出现登记全局站序，站在分区间迁移时不改变这个次序。"""
+
+        if station not in self._station_order:
+            self._station_order.append(station)
 
     def assign(self, station: str, zone_name: str) -> str:
         """把一个站划入分区，同时维护两份索引。"""
@@ -75,6 +84,7 @@ class ZoneRegistry:
         if previous is not None and previous != zone_name:
             self._zones[previous].drop_station(station)
         zone.add_station(station)
+        self._track(station)
         self._station_zone[station] = zone_name
         return zone_name
 
@@ -106,6 +116,31 @@ class ZoneRegistry:
         self._splits += 1
         self.rebuild_index()
         return child
+
+    def merge_zone(self, child_name: str, source_name: str) -> Zone:
+        """把拆分出的新分区并回原分区（回滚用），返回原分区。
+
+        这是 :meth:`split` 的逆操作：新分区必须存在，其全部站划回原分区，新分区
+        注销。只动归属，不碰任何热量计数。
+        """
+
+        if child_name == source_name:
+            raise NamespaceError("回并的两个分区不能同名", component="ns")
+        child = self.get(child_name)
+        source = self.get(source_name)
+        moving = list(child.stations)
+        for station in moving:
+            child.drop_station(station)
+            source.add_station(station)
+        del self._zones[child_name]
+        self._merges += 1
+        self.rebuild_index()
+        return source
+
+    def all_station_order(self) -> list[str]:
+        """返回全部站的全局次序（按首次登记，不随迁移改变）。"""
+
+        return list(self._station_order)
 
     def rebuild_index(self) -> int:
         """按分区表重建"站 → 分区"反向索引，返回索引条目数。"""
@@ -145,12 +180,18 @@ class ZoneRegistry:
 
         return self._splits
 
+    def merges(self) -> int:
+        """返回累计回并次数。"""
+
+        return self._merges
+
     def describe(self) -> dict:
         """汇总分区与索引，供状态快照读取。"""
 
         return {
             "count": len(self._zones),
             "splits": self._splits,
+            "merges": self._merges,
             "zones": [self._zones[name].as_dict() for name in self.names()],
             "index": dict(sorted(self._station_zone.items())),
         }
